@@ -1,18 +1,30 @@
 import os
 import requests
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
 from fastapi import FastAPI, Request
 from openai import OpenAI
 
 app = FastAPI()
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# =========================
+# CONFIG
+# =========================
 
-# --- Bot tokens ---
-TELEGRAM_TOKEN_MAIN = os.environ["TELEGRAM_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_TOKEN_2 = os.environ.get("TELEGRAM_TOKEN_2")
 
-# --- Bot prompts ---
-SYSTEM_PROMPT_MAIN = """
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# =========================
+# PROMPTS
+# =========================
+
+MAIN_BOT_PROMPT = """
 You are the user's elite personal AI agent.
 
 Mission:
@@ -59,33 +71,82 @@ Default response structure when useful:
 Your standard should be exceptional usefulness.
 """.strip()
 
-SYSTEM_PROMPT_2 = """
+PROJECT_BOT_PROMPT = """
 You are the user's second elite AI agent for a separate project.
 
-Your job:
-- Focus deeply on the user's second project.
-- Keep this project separate from the main bot.
-- Be highly strategic, practical, structured, and action-oriented.
-- Help the user think more clearly, move faster, and execute better.
-- Suggest concrete next steps and useful prioritization.
-- Act like a top-tier operator, not a generic chatbot.
+Mission:
+Help the user build, improve, and execute this specific project with exceptional clarity and leverage.
+
+Operating style:
+- Think like a top-tier operator and strategist.
+- Be highly practical, structured, and action-oriented.
+- Focus on execution, prioritization, speed, and quality.
+- Keep this bot's project context separate from the user's other bots and projects.
+
+What to optimize for:
+- Clarity
+- Momentum
+- Better decisions
+- High-leverage actions
+- Competitive advantage
+- Strong execution
 
 Rules:
-- Be sharp, concise, and useful.
-- Structure answers clearly when it helps.
-- Prioritize practical actions over vague ideas.
-- If something is uncertain, say so clearly.
-- Always try to increase leverage, clarity, speed, and quality.
+- Be concise, sharp, and useful.
+- Structure answers when helpful.
+- Turn messy ideas into clear actions.
+- If something is uncertain, say so.
+- Prefer concrete next steps over abstract discussion.
 """.strip()
 
+# =========================
+# BOT CONFIG
+# =========================
 
-def chunk_text(text: str, max_length: int = 4000):
+@dataclass
+class BotConfig:
+    name: str
+    token: str
+    prompt: str
+    webhook_path: str
+
+
+def get_bot_configs() -> Dict[str, BotConfig]:
+    bots: Dict[str, BotConfig] = {}
+
+    if TELEGRAM_TOKEN:
+        bots["main"] = BotConfig(
+            name="main",
+            token=TELEGRAM_TOKEN,
+            prompt=MAIN_BOT_PROMPT,
+            webhook_path="/webhook/main",
+        )
+
+    if TELEGRAM_TOKEN_2:
+        bots["project"] = BotConfig(
+            name="project",
+            token=TELEGRAM_TOKEN_2,
+            prompt=PROJECT_BOT_PROMPT,
+            webhook_path="/webhook/project",
+        )
+
+    return bots
+
+
+def get_bot(bot_name: str) -> Optional[BotConfig]:
+    return get_bot_configs().get(bot_name)
+
+# =========================
+# HELPERS
+# =========================
+
+def chunk_text(text: str, max_length: int = 4000) -> List[str]:
     if not text:
         return ["I could not generate a response."]
     return [text[i:i + max_length] for i in range(0, len(text), max_length)]
 
 
-async def send_message(token: str, chat_id: int, text: str):
+async def send_message(token: str, chat_id: int, text: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     for chunk in chunk_text(text):
@@ -93,15 +154,15 @@ async def send_message(token: str, chat_id: int, text: str):
             url,
             json={
                 "chat_id": chat_id,
-                "text": chunk
+                "text": chunk,
             },
-            timeout=30
+            timeout=30,
         )
 
 
 def generate_answer(system_prompt: str, user_text: str) -> str:
     response = client.responses.create(
-        model="gpt-4.1-mini",
+        model=OPENAI_MODEL,
         input=[
             {
                 "role": "system",
@@ -113,10 +174,32 @@ def generate_answer(system_prompt: str, user_text: str) -> str:
             }
         ]
     )
-    return response.output_text.strip()
+
+    text = getattr(response, "output_text", None)
+    if text:
+        return text.strip()
+
+    return "I could not generate a response."
+
+# =========================
+# ROUTES
+# =========================
+
+@app.get("/")
+async def healthcheck():
+    bots = get_bot_configs()
+    return {
+        "status": "ok",
+        "model": OPENAI_MODEL,
+        "bots": list(bots.keys())
+    }
 
 
-async def process_telegram_message(req: Request, token: str, system_prompt: str):
+async def process_message(req: Request, bot_name: str):
+    bot = get_bot(bot_name)
+    if not bot:
+        return {"status": "error", "message": f"Bot '{bot_name}' is not configured"}
+
     data = await req.json()
 
     if "message" not in data:
@@ -127,45 +210,27 @@ async def process_telegram_message(req: Request, token: str, system_prompt: str)
     text = message.get("text", "").strip()
 
     if not text:
-        await send_message(token, chat_id, "Please send me a text message.")
+        await send_message(bot.token, chat_id, "Please send me a text message.")
         return {"status": "ok"}
 
     try:
-        answer = generate_answer(system_prompt, text)
-        await send_message(token, chat_id, answer)
+        answer = generate_answer(bot.prompt, text)
+        await send_message(bot.token, chat_id, answer)
     except Exception as e:
-        await send_message(token, chat_id, f"Error while generating the response: {str(e)}")
+        await send_message(
+            bot.token,
+            chat_id,
+            f"Error while generating the response: {str(e)}"
+        )
 
     return {"status": "ok"}
 
 
-@app.get("/")
-async def healthcheck():
-    return {
-        "status": "ok",
-        "bots": {
-            "main": bool(TELEGRAM_TOKEN_MAIN),
-            "bot2": bool(TELEGRAM_TOKEN_2)
-        }
-    }
-
-
 @app.post("/webhook/main")
 async def telegram_webhook_main(req: Request):
-    return await process_telegram_message(
-        req=req,
-        token=TELEGRAM_TOKEN_MAIN,
-        system_prompt=SYSTEM_PROMPT_MAIN
-    )
+    return await process_message(req, "main")
 
 
 @app.post("/webhook/project")
 async def telegram_webhook_project(req: Request):
-    if not TELEGRAM_TOKEN_2:
-        return {"status": "error", "message": "TELEGRAM_TOKEN_2 is not configured"}
-
-    return await process_telegram_message(
-        req=req,
-        token=TELEGRAM_TOKEN_2,
-        system_prompt=SYSTEM_PROMPT_2
-    )
+    return await process_message(req, "project")
